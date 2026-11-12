@@ -53,7 +53,186 @@ lazy-проблемы ловятся сразу, а не «маскируютс�
 - Maven 3.9+
 - Docker Desktop (для PostgreSQL и тестов)
 
-### 1. Поднять БД
+### Поднять БД
 
 ```bash
 docker compose up -d
+```
+
+### Запустить приложение
+
+```
+mvn spring-boot:run
+```
+### Открыть Swagger UI
+
+http://localhost:8080/swagger-ui.html
+Все эндпоинты документированы, можно вызывать из браузера
+---
+
+## Параметры подключения
+
+Параметры БД вынесены в `application.yml` и переопределяются через переменные окружения
+(пароли в коде не хранятся):
+
+| Переменная | Значение по умолчанию |
+|---|---|
+| `DB_URL` | `jdbc:postgresql://localhost:5432/orm` |
+| `DB_USER` | `orm` |
+| `DB_PASSWORD` | `orm` |
+
+Схема БД создаётся автоматически (`spring.jpa.hibernate.ddl-auto: update`).
+При первом запуске `DataInitializer` (профиль `!test`) наполняет БД демо-данными:
+2 преподавателя, 2 студента, 2 курса с модулями и уроками, тест, отзыв, сдача задания.
+
+---
+
+## Тесты
+
+```bash
+mvn test
+```
+
+**8 интеграционных тестов** на реальном PostgreSQL 18 в Testcontainers
+(singleton-контейнер — запускается один раз на весь прогон и переиспользуется
+между тест-классами).
+
+### Что проверяет каждый тест
+
+| Тест | Что проверяет | Ожидаемый результат |
+|---|---|---|
+| `CascadeIntegrationTest.cascadePersist_savesModulesAndLessonsTogether` | `cascade = CascadeType.ALL` на `Course.modules` и `CourseModule.lessons`: сохранение одного Course `save()`-ом должно каскадно сохранить вложенные модули и уроки | После `em.clear()` повторная загрузка через `findByIdWithModulesAndLessons` возвращает курс с 1 модулем и 1 уроком, у урока корректный title |
+| `CascadeIntegrationTest.cascadeDelete_deletesWholeSubtree` | Удаление `Course` каскадно (`cascade=ALL`, `orphanRemoval=true`) удаляет всё поддерево: модули → уроки → задания → сдачи | После `delete(course)` + `flush` таблицы `modules`, `lessons`, `assignments`, `submissions` пусты по этому поддереву |
+| `CascadeIntegrationTest.removingFromCollection_orphanRemoval_deletesChild` | `orphanRemoval=true`: удаление ребёнка из коллекции `course.modules` удаляет запись из БД | После `course.removeModule(m2)` + `flush` вызов `moduleRepository.findById(m2Id)` возвращает `Optional.empty()` |
+| `LazyLoadingTest.accessingLazyCollectionOutsideTransaction_throwsLazyInitializationException` | **Демонстрация lazy-проблемы** (требование ТЗ, этап 3): курс загружен в одной транзакции, возвращён наружу, обращение к `course.getModules().size()` **вне сессии** | Бросается `LazyInitializationException` (проверяется через `assertThrows`, без привязки к тексту — в Hibernate 7 формат сообщения отличается от Hibernate 5/6) |
+| `LazyLoadingTest.joinFetchLoadsCollection_eagerly_avoidsException` | **Решение проблемы** через `JOIN FETCH`: `findByIdWithModules` инициализирует коллекцию внутри транзакции | После закрытия транзакции `loaded.getModules().size()` == 2 без исключения; элементы коллекции доступны |
+| `LazyLoadingTest.accessingLazyCollectionInsideTransaction_works` | Открытая сессия → lazy подгружается прозрачно (используется `TransactionTemplate`) | Внутри `tx.execute(...)` вызов `course.getModules().stream().map(...)` работает, возвращает ожидаемые title'ы |
+| `CourseWorkflowTest.fullCourseScenario_endToEnd` | **Сквозной сценарий** бизнес-логики: teacher + student → category → course → module → lesson → assignment → submission → grade → enrollment → quiz → quiz-submission → review. Плюс negative-кейсы | Все шаги отрабатывают; повторные `enroll` / `submit` / `review` того же студента бросают `BusinessException`; оценка вне `[0, maxScore]` — `BusinessException`; зачисление `TEACHER` в студенты — `BusinessException`; отзыв от незачисленного студента — `BusinessException`; правильный ответ на тест → score = 100, неправильный → 0 |
+| `CourseWorkflowTest.courseUpdate_usesDirtyChecking` | Обновление managed-entity через **dirty checking** (без явного `save()`): `courseService.update(...)` меняет поля у загруженной сущности, изменения должны уйти в БД на коммите | Повторное чтение `courseService.getById(...)` возвращает обновлённые `title` и `description` |
+
+### Как устроены тесты
+
+- Все тесты наследуют `AbstractIntegrationTest` — базовый класс с singleton-контейнером
+  `PostgreSQLContainer<>("postgres:18-alpine")`, который поднимается **один раз на JVM** в
+  `static { }`. Это критично: Spring кэширует `ApplicationContext` (вместе с `HikariPool`) между
+  тест-классами, и если контейнер останавливать на `@Container`, закэшированный пул будет
+  стучаться на уже закрытый порт и падать с `Connection refused`.
+- `@ActiveProfiles("test")` → подгружается `application-test.yml` с `ddl-auto: create-drop`.
+  Каждый прогон начинается с чистой схемы.
+- `@SpringBootTest` поднимает полный контекст (JPA, сервисы, репозитории), но **без** Tomcat —
+  `webEnvironment` по умолчанию `MOCK`, что ускоряет прогон.
+- `DataInitializer` под `@Profile("!test")` — демо-данные в тестах не создаются.
+- Тесты на CRUD и каскады помечены `@Transactional` на уровне класса — каждый тест
+  откатывается автоматически, БД остаётся чистой между тестами.
+- `LazyLoadingTest` **намеренно** без `@Transactional`, иначе сессия живёт весь тест и
+  `LazyInitializationException` не выбросится. Помечен `@DirtiesContext(AFTER_CLASS)`, чтобы
+  данные не протекали в следующий класс.
+
+---
+
+## REST API
+
+### Курсы
+
+| Метод | Путь | Описание |
+|---|---|---|
+| GET | `/api/courses` | Список курсов (с кол-вом студентов и средним рейтингом) |
+| GET | `/api/courses/{id}` | Полный курс с модулями, уроками, заданиями |
+| POST | `/api/courses` | Создать курс (JSON-body `CreateCourseRequest`) |
+| PUT | `/api/courses/{id}` | Обновить курс |
+| DELETE | `/api/courses/{id}` | Удалить курс (каскадно) |
+| POST | `/api/courses/{id}/enroll?studentId=` | Записать студента |
+| GET | `/api/courses/{id}/enrollments` | Список записанных |
+| POST | `/api/courses/{id}/modules?title=&orderIndex=` | Добавить модуль |
+| POST | `/api/courses/modules/{moduleId}/lessons?title=` | Добавить урок |
+| POST | `/api/courses/{id}/reviews?studentId=&rating=&comment=` | Оставить отзыв |
+| GET | `/api/courses/{id}/reviews` | Список отзывов |
+
+### Пользователи
+
+| Метод | Путь | Описание |
+|---|---|---|
+| GET | `/api/users` | Все пользователи |
+| GET | `/api/users/{id}` | Пользователь + профиль |
+| POST | `/api/users?name=&email=&role=` | Создать |
+| PUT | `/api/users/{id}/profile?bio=&avatarUrl=` | Обновить профиль |
+| GET | `/api/users/{id}/enrollments` | Курсы пользователя |
+| GET | `/api/users/{id}/submissions` | Сдачи пользователя |
+
+### Задания и тесты
+
+| Метод | Путь | Описание |
+|---|---|---|
+| POST | `/api/assignments/{id}/submit?studentId=&content=` | Сдать задание |
+| PUT | `/api/submissions/{id}/grade?score=&feedback=` | Оценить |
+| GET | `/api/assignments/{id}/submissions` | Все сдачи по заданию |
+| GET | `/api/quizzes/{id}` | Тест с вопросами и вариантами |
+| POST | `/api/quizzes/modules/{moduleId}?title=&timeLimit=` | Создать тест |
+| POST | `/api/quizzes/{id}/submit?studentId=` | Пройти тест |
+
+**Пример прохождения теста:**
+
+```bash
+curl -X POST 'http://localhost:8080/api/quizzes/1/submit?studentId=3' \
+  -H 'Content-Type: application/json' \
+  -d '{"answers": {"1": [1], "2": [4, 5]}}'
+```
+
+`answers` — `Map<questionId, List<optionId>>`. Для `SINGLE_CHOICE` в списке один ID,
+для `MULTIPLE_CHOICE` — несколько. Балл = процент полностью верных ответов
+(множество выбранных == множество правильных).
+
+### Обработка ошибок
+
+Все ошибки возвращаются как `ProblemDetail` (RFC 7807):
+
+- `404 Not Found` — `NotFoundException` (например, курс с несуществующим id)
+- `400 Bad Request` — `BusinessException` (нарушено бизнес-правило) /
+  `MethodArgumentNotValidException` (ошибки валидации DTO)
+- `500 Internal Server Error` — непредвиденные ошибки
+
+---
+## Ключевые архитектурные решения
+
+### 1. Lazy-загрузка и `open-in-view=false`
+
+Все коллекции - `LAZY`. Сессия закрывается на выходе из сервиса. Это значит:
+
+- обращение к `course.getModules()` из контроллера вне транзакции → `LazyInitializationException`
+  (демонстрируется в `LazyLoadingTest`);
+- контроллеры возвращают **DTO**, собранные внутри транзакции сервиса - сериализация Jackson'ом
+  безопасна.
+
+### 2. `MultipleBagFetchException` и `default_batch_fetch_size`
+
+`JOIN FETCH` двух `List`-коллекций в одном запросе Hibernate 6/7 запрещает. Решение:
+
+- одна коллекция — через `JOIN FETCH`, вторая - через `default_batch_fetch_size: 50`
+  (один `SELECT ... IN (...)` на пачку вместо N+1);
+- в `QuizRepository` - раздельные методы `findByIdWithQuestionsAndOptions` и `findByIdWithSubmissions`.
+
+### 3. Двусторонняя консистентность через helper-методы
+
+`Course.addModule()`, `CourseModule.addLesson()`, `Quiz.addQuestion()` ставят обе стороны связи.
+Без них `quiz.getQuestions()` остался бы пустым в памяти (inverse side Hibernate игнорирует) -
+эту ошибку `Quiz has no questions` мы и поймали тестами.
+
+### 4. `saveAndFlush` там, где нужен id до коммита
+
+`CourseService.addModule` и `addLesson` возвращают сущность, у которой сразу должен быть `id`
+(для следующей операции). `saveAndFlush` гарантирует INSERT до возврата.
+
+### 5. Каскады
+
+- `Course → CourseModule → Lesson → Assignment → Submission` — `cascade=ALL, orphanRemoval=true`.
+  Удаление курса сносит всё поддерево (просто, но данные теряются — осознанный trade-off).
+- `ManyToMany` `Course ↔ Tag` — только `PERSIST`/`MERGE`, чтобы удаление курса не снесло теги.
+
+### 6. Singleton-контейнер в тестах
+
+`AbstractIntegrationTest` запускает Testcontainers в `static { }` один раз на JVM.
+Spring кэширует `ApplicationContext` с `HikariPool`, поэтому контейнер **нельзя останавливать**
+между тест-классами — иначе закэшированный пул смотрит на мёртвый порт и падает с
+`Connection refused`.
+
+---
