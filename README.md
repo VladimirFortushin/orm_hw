@@ -178,7 +178,7 @@ curl -X POST 'http://localhost:8080/api/quizzes/1/submit?studentId=3' \
   -d '{"answers": {"1": [1], "2": [4, 5]}}'
 ```
 
-`answers` — `Map<questionId, List<optionId>>`. Для `SINGLE_CHOICE` в списке один ID,
+`answers` - `Map<questionId, List<optionId>>`. Для `SINGLE_CHOICE` в списке один ID,
 для `MULTIPLE_CHOICE` — несколько. Балл = процент полностью верных ответов
 (множество выбранных == множество правильных).
 
@@ -191,48 +191,3 @@ curl -X POST 'http://localhost:8080/api/quizzes/1/submit?studentId=3' \
   `MethodArgumentNotValidException` (ошибки валидации DTO)
 - `500 Internal Server Error` — непредвиденные ошибки
 
----
-## Ключевые архитектурные решения
-
-### 1. Lazy-загрузка и `open-in-view=false`
-
-Все коллекции - `LAZY`. Сессия закрывается на выходе из сервиса. Это значит:
-
-- обращение к `course.getModules()` из контроллера вне транзакции → `LazyInitializationException`
-  (демонстрируется в `LazyLoadingTest`);
-- контроллеры возвращают **DTO**, собранные внутри транзакции сервиса - сериализация Jackson'ом
-  безопасна.
-
-### 2. `MultipleBagFetchException` и `default_batch_fetch_size`
-
-`JOIN FETCH` двух `List`-коллекций в одном запросе Hibernate 6/7 запрещает. Решение:
-
-- одна коллекция — через `JOIN FETCH`, вторая - через `default_batch_fetch_size: 50`
-  (один `SELECT ... IN (...)` на пачку вместо N+1);
-- в `QuizRepository` - раздельные методы `findByIdWithQuestionsAndOptions` и `findByIdWithSubmissions`.
-
-### 3. Двусторонняя консистентность через helper-методы
-
-`Course.addModule()`, `CourseModule.addLesson()`, `Quiz.addQuestion()` ставят обе стороны связи.
-Без них `quiz.getQuestions()` остался бы пустым в памяти (inverse side Hibernate игнорирует) -
-эту ошибку `Quiz has no questions` мы и поймали тестами.
-
-### 4. `saveAndFlush` там, где нужен id до коммита
-
-`CourseService.addModule` и `addLesson` возвращают сущность, у которой сразу должен быть `id`
-(для следующей операции). `saveAndFlush` гарантирует INSERT до возврата.
-
-### 5. Каскады
-
-- `Course → CourseModule → Lesson → Assignment → Submission` — `cascade=ALL, orphanRemoval=true`.
-  Удаление курса сносит всё поддерево (просто, но данные теряются — осознанный trade-off).
-- `ManyToMany` `Course ↔ Tag` — только `PERSIST`/`MERGE`, чтобы удаление курса не снесло теги.
-
-### 6. Singleton-контейнер в тестах
-
-`AbstractIntegrationTest` запускает Testcontainers в `static { }` один раз на JVM.
-Spring кэширует `ApplicationContext` с `HikariPool`, поэтому контейнер **нельзя останавливать**
-между тест-классами — иначе закэшированный пул смотрит на мёртвый порт и падает с
-`Connection refused`.
-
----
