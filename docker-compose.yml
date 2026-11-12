@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: orm-postgres
+    environment:
+      POSTGRES_DB: orm
+      POSTGRES_USER: orm
+      POSTGRES_PASSWORD: orm
+    ports:
+      - "5432:5432"
+    volumes:
+      - orm_pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orm -d orm"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  orm_pgdata:

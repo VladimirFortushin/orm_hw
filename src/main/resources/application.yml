@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: orm
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/orm}
+    username: ${DB_USER:orm}
+    password: ${DB_PASSWORD:orm}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        show_sql: false
+        default_batch_fetch_size: 50
+    open-in-view: false
+  jackson:
+    datatype:
+      datetime:
+        WRITE_DATES_AS_TIMESTAMPS: false
+
+server:
+  port: 8080
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+logging:
+  level:
+    org.hibernate.SQL: INFO
+    org.hibernate.orm.jdbc.bind: INFO
+    ru.fortushin: DEBUG
